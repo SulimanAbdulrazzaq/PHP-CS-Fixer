@@ -1,0 +1,68 @@
+name: s15-pcf-scan
+on: push
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - run: git log -3 --format='%H %T %s'
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, tokenizer, xml, intl, curl
+          tools: composer
+      - name: composer update
+        run: composer update --no-interaction --no-progress --prefer-dist 2>&1 | tail -3
+      - name: fetch corpora
+        run: |
+          mkdir -p /tmp/pristine && cd /tmp/pristine
+          git clone --depth 1 -q https://github.com/symfony/symfony.git symfony
+          git clone --depth 1 -q https://github.com/laravel/framework.git laravel
+          git clone --depth 1 -q https://github.com/composer/composer.git composer
+          git clone --depth 1 -q https://github.com/doctrine/orm.git orm
+          git clone --depth 1 -q https://github.com/twigphp/Twig.git twig
+          git clone --depth 1 -q https://github.com/WordPress/wordpress-develop.git wordpress
+          git clone --depth 1 -q https://github.com/nikic/PHP-Parser.git phpparser
+          git clone --depth 1 -q https://github.com/phpstan/phpstan-src.git phpstan
+          find /tmp/pristine -name '*.php' -not -path '*/.git/*' -not -path '*/Fixtures/*' -not -path '*/fixtures/*' -not -path '*/vendor/*' -not -path '*/node_modules/*' | wc -l
+      - name: keep only files that are valid PHP 8.4
+        run: |
+          cd /tmp/pristine
+          find . -name '*.php' -not -path '*/.git/*' -not -path '*/Fixtures/*' -not -path '*/fixtures/*' -not -path '*/vendor/*' -not -path '*/node_modules/*' -print0 | xargs -0 -n 50 -P 4 php -l 2>&1 | grep -a -E "^(PHP )?(Parse|Fatal) error" | sed -E 's/ in (.*) on line.*/ \1/' | awk '{print $NF}' | sort -u > /tmp/invalid.txt || true
+          wc -l /tmp/invalid.txt
+          mkdir -p /tmp/work
+          find . -name '*.php' -not -path '*/.git/*' -not -path '*/Fixtures/*' -not -path '*/fixtures/*' -not -path '*/vendor/*' -not -path '*/node_modules/*' | sed 's|^\./||' | sort > /tmp/all.txt
+          grep -v -F -f <(sed 's|^/tmp/pristine/||; s|^\./||' /tmp/invalid.txt) /tmp/all.txt > /tmp/valid.txt || cp /tmp/all.txt /tmp/valid.txt
+          wc -l /tmp/valid.txt
+          rsync -a --files-from=/tmp/valid.txt /tmp/pristine/ /tmp/work/
+      - name: run the fixers
+        run: |
+          set +e
+          cat > /tmp/cfg.php <<'PHPEOF'
+          <?php
+          $finder = (new PhpCsFixer\Finder())->in('/tmp/work')->name('*.php');
+          return (new PhpCsFixer\Config())->setRiskyAllowed(true)->setParallelConfig(PhpCsFixer\Runner\Parallel\ParallelConfigFactory::detect())->setUsingCache(false)->setFinder($finder)->setRules(['@PhpCsFixer:risky' => true, '@PHP8x5Migration:risky' => true, '@PER-CS:risky' => true]);
+          PHPEOF
+          time php php-cs-fixer fix --config=/tmp/cfg.php --no-interaction --format=json -v > /tmp/report.json 2> /tmp/stderr.txt
+          echo "exit: $?"
+          head -c 3000 /tmp/stderr.txt
+          python3 - <<'PYEOF'
+          import json
+          d = json.load(open('/tmp/report.json'))
+          print('files changed:', len(d.get('files', [])))
+          PYEOF
+      - name: files that are no longer valid PHP
+        run: |
+          set +e
+          cd /tmp/work
+          sed 's|^|/tmp/work/|' /tmp/valid.txt > /dev/null
+          xargs -a /tmp/valid.txt -n 50 -P 4 php -l 2>&1 | grep -a -E "^(PHP )?(Parse|Fatal) error" | sed -E 's/.* in (.*) on line.*/\1/' | sort -u > /tmp/broken_abs.txt
+          wc -l /tmp/broken_abs.txt
+          sed 's|^/tmp/work/||' /tmp/broken_abs.txt > /tmp/broken.txt
+          head -40 /tmp/broken.txt
+          cd $GITHUB_WORKSPACE
+          head -30 /tmp/broken.txt > /tmp/broken30.txt
+          php .s15/pcf_bisect.php /tmp/report.json /tmp/work /tmp/pristine /tmp/broken30.txt 2>&1 | head -120
